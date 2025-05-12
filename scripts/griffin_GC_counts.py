@@ -101,6 +101,11 @@ sys.stdout.flush()
 
 
 def collect_reads(sublist):
+    """
+    Function to create a dictionary of dictionaries that holds the frequency of each read length and GC content combination. 
+    Additional logic is included to handle single-end sequencing. This version uses sequence length in place of a read's template length attribute
+    to represent read length. 
+    """
     #create a dict for holding the frequency of each read length and GC content
     GC_dict = {}
     for length in range(size_range[0],size_range[1]+1):
@@ -116,7 +121,6 @@ def collect_reads(sublist):
     #this might also need to be in the loop
     #import the ref_seq
     ref_seq=pysam.FastaFile(ref_seq_path)
-    
     for i in range(len(sublist)):
         chrom = sublist.iloc[i][0]
         start = sublist.iloc[i][1]
@@ -128,7 +132,7 @@ def collect_reads(sublist):
         fetched = bam_file.fetch(chrom,start,end)
         for read in fetched:
             #use both fw (positive template length) and rv (negative template length) reads
-            if (read.is_reverse==False and read.template_length>=size_range[0] and read.template_length<=size_range[1]) or             (read.is_reverse==True and -read.template_length>=size_range[0] and -read.template_length<=size_range[1]):
+            if (read.is_reverse==False and read.template_length>=size_range[0] and read.template_length<=size_range[1]) or (read.is_reverse==True and -read.template_length>=size_range[0] and -read.template_length<=size_range[1]):
                 #qc filters, some longer fragments are considered 'improper pairs' but I would like to keep these
                 if read.is_paired==True and read.mapping_quality>=map_q and read.is_duplicate==False and read.is_qcfail==False:
                     if read.is_reverse==False:
@@ -146,10 +150,34 @@ def collect_reads(sublist):
                     rng = np.random.default_rng(fragment_start)
                     fragment_seq[np.isin(fragment_seq, ['N','R','Y','K','M','B','D','H','V'])] = rng.integers(2, size=len(fragment_seq[np.isin(fragment_seq, ['N','R','Y','K','M','B','D','H','V'])])) #random integer in range(2) (i.e. 0 or 1)
                     fragment_seq = fragment_seq.astype(float)
-                    
+
                     
                     num_GC = int(fragment_seq.sum())
                     GC_dict[abs(read.template_length)][num_GC]+=1
+                    
+            # Additional logic to handle single-end reads. 
+            elif read.is_paired==False and read.mapping_quality>= map_q and read.is_duplicate==False and read.is_qcfail==False: 
+                if read.is_reverse: 
+                    rl = len(read.seq)
+                    fragment_end = read.reference_end + rl 
+                    fragment_start= read.reference_end 
+                if not read.is_reverse: 
+                    rl = len(read.seq)
+                    fragment_end = read.reference_start + rl
+                    fragment_start= read.reference_start 
+                # check the read length is within the designated size range
+                if rl >=size_range[0] and rl <= size_range[1]:
+                    fragment_seq = ref_seq.fetch(read.reference_name,fragment_start,fragment_end)
+                    fragment_seq = np.array(list(fragment_seq.upper()))
+                    fragment_seq[np.isin(fragment_seq, ['A','T','W'])] = 0
+                    fragment_seq[np.isin(fragment_seq, ['C','G','S'])] = 1
+                    rng = np.random.default_rng(fragment_start)
+                    fragment_seq[np.isin(fragment_seq, ['N','R','Y','K','M','B','D','H','V'])] = rng.integers(2, size=len(fragment_seq[np.isin(fragment_seq, ['N','R','Y','K','M','B','D','H','V'])])) #random integer in range(2) (i.e. 0 or 1)
+                    fragment_seq = fragment_seq.astype(float)
+                        
+                    num_GC = int(fragment_seq.sum())
+                    breakpoint()
+                    GC_dict[abs(rl)][num_GC]+=1
 
     print('done')
     return(GC_dict)
@@ -157,7 +185,7 @@ def collect_reads(sublist):
 
 # In[ ]:
 
-
+## Parallel processing applied to the collect_reads function
 start_time = time.time()
 p = Pool(processes=CPU) #use the available CPU
 sublists = np.array_split(mappable_intervals,CPU) #split the list into sublists, one per CPU
@@ -169,10 +197,11 @@ GC_dict_list = p.map(collect_reads, sublists, 1)
 
 
 all_GC_df = pd.DataFrame()
-for i,GC_dict in enumerate(GC_dict_list):
+for i, GC_dict in enumerate(GC_dict_list):
     GC_df = pd.DataFrame()
-    for length in GC_dict.keys():
-        current = pd.Series(GC_dict[length]).reset_index()
+    curr_dict = GC_dict_list.get(GC_dict)
+    for length in curr_dict.keys():
+        current = pd.Series(curr_dict[length]).reset_index()
         current = current.rename(columns={'index':'num_GC',0:'number_of_fragments'})
         current['length']=length
         current = current[['length','num_GC','number_of_fragments']]
