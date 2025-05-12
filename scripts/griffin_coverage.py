@@ -314,6 +314,7 @@ all_sites = griffin_functions.define_fetch_interval('Total sites',all_sites,chro
 start_time = time.time()
 all_sites_bed = pybedtools.BedTool.from_dataframe(all_sites[[chrom_column,'fetch_start','fetch_end']])
 all_sites_bed = all_sites_bed.sort()
+# Merges any overlapping sites
 all_sites_bed = all_sites_bed.merge()
 print('Intervals to fetch:\t'+str(len(all_sites_bed)))
 print('Total bp to fetch:\t'+str(all_sites_bed.total_coverage()))
@@ -340,6 +341,13 @@ pybedtools.cleanup(verbose=False, remove_all=True)
 
 
 def collect_fragments(input_list):
+    """
+    Collects fragments for a single site. 
+    Added logic to handle single end reads. The fragment length is calculated using sequence length.
+    'Regular' (paired-end read) data uses the template length attribute to get fragment length. 
+    params:
+        input list = [index, chrom, start, end]
+    """
     i,chrom,start,end = input_list
     #open the bam file for each pool worker (otherwise individual pool workers can close it)
     bam_file = pysam.AlignmentFile(bam_path)
@@ -364,14 +372,70 @@ def collect_fragments(input_list):
     ########################
     for read in fetched:
         #filter out reads
-        if abs(read.template_length)>=sz_range[0] and abs(read.template_length)<=sz_range[1]         and read.is_paired==True and read.mapping_quality>=map_q and read.is_duplicate==False and read.is_qcfail==False:
-            #only use fw reads with positive fragment lengths (negative indicates an abnormal pair)
-            #all paired end reads have a fw and rv read so we don't need the rv read to find the midpoint.
-            if read.is_reverse==False and read.template_length>0:
-                fragment_start = read.reference_start #for fw read, read start is fragment start
-                fragment_end = read.reference_start+read.template_length
-                midpoint = int(np.floor((fragment_start+fragment_end)/2))
-                                
+        if read.is_paired:
+            if abs(read.template_length)>=sz_range[0] and abs(read.template_length)<=sz_range[1] and read.mapping_quality>=map_q and read.is_duplicate==False and read.is_qcfail==False:
+                #only use fw reads with positive fragment lengths (negative indicates an abnormal pair)
+                #all paired end reads have a fw and rv read so we don't need the rv read to find the midpoint.
+                if read.is_reverse==False and read.template_length>0:
+                    fragment_start = read.reference_start #for fw read, read start is fragment start
+                    fragment_end = read.reference_start+read.template_length
+                    midpoint = int(np.floor((fragment_start+fragment_end)/2))
+                                    
+                    #count the GC content
+                    fragment_seq = ref_seq.fetch(read.reference_name,fragment_start,fragment_end)
+                    fragment_seq = np.array(list(fragment_seq.upper()))
+                    fragment_seq[np.isin(fragment_seq, ['A','T','W'])] = 0
+                    fragment_seq[np.isin(fragment_seq, ['C','G','S'])] = 1
+                    rng = np.random.default_rng(fragment_start)
+                    fragment_seq[np.isin(fragment_seq, ['N','R','Y','K','M','B','D','H','V'])] = rng.integers(2, size=len(fragment_seq[np.isin(fragment_seq, ['N','R','Y','K','M','B','D','H','V'])])) #random integer in range(2) (i.e. 0 or 1)
+                    fragment_seq = fragment_seq.astype(float)
+        
+                    if mappability_correction.lower() == 'true':
+                        #find the two read locations for mappability correction
+                        fw_read_map = mappability.values(chrom,read.reference_start,read.reference_start+read.reference_length)
+                        fw_read_map = np.mean(np.nan_to_num(fw_read_map)) #replace any nan with zero and take the mean
+
+                        rv_read_map = mappability.values(chrom,read.reference_start+read.template_length-read.reference_length,read.reference_start+read.template_length)
+                        rv_read_map = np.mean(np.nan_to_num(rv_read_map)) #replace any nan with zero and take the mean
+                                    
+                    #check that the site is in the window          
+                    if midpoint>=start and midpoint<end:
+                        #count the fragment
+                        cov_dict[midpoint]+=1
+
+                        ##get the GC bias
+                        read_GC_content = sum(fragment_seq)
+                        read_GC_bias = GC_bias[abs(read.template_length)][read_GC_content]
+
+                        #count the fragment weighted by GC bias
+                        if not np.isnan(read_GC_bias):
+                            GC_cov_dict[midpoint]+=(1/read_GC_bias)
+                            
+                        if mappability_correction.lower() == 'true':
+                            #get the mappability bias
+                            read_map = np.int32(np.round(100*(fw_read_map+rv_read_map)/2))
+                            read_map_bias = mappability_bias[read_map]
+                            GC_map_cov_dict[midpoint]+=(1/read_GC_bias)*(1/read_map_bias)
+                            
+                        #print(read_GC_bias,read_map,read_map_bias)
+                        
+                    else: #if fragment doesn't fully overlap
+                        continue
+                        
+                    del(read,midpoint,fragment_seq)
+
+        else: # handling the single-end reads
+            if len(read.seq)>=sz_range[0] and len(read.seq)<=sz_range[1] and read.mapping_quality>=map_q and read.is_duplicate==False and read.is_qcfail==False:
+                rl = len(read.seq)
+                if read.is_reverse == False:
+                    fragment_start = read.reference_start #for fw read, read start is fragment start
+                    fragment_end = read.reference_start+rl
+                    midpoint = int(np.floor((fragment_start+fragment_end)/2))
+                else: 
+                    fragment_start = read.reference_end #for fw read, read start is fragment start
+                    fragment_end = read.reference_end+rl
+                    midpoint = int(np.floor((fragment_start+fragment_end)/2))
+                                    
                 #count the GC content
                 fragment_seq = ref_seq.fetch(read.reference_name,fragment_start,fragment_end)
                 fragment_seq = np.array(list(fragment_seq.upper()))
@@ -386,17 +450,17 @@ def collect_fragments(input_list):
                     fw_read_map = mappability.values(chrom,read.reference_start,read.reference_start+read.reference_length)
                     fw_read_map = np.mean(np.nan_to_num(fw_read_map)) #replace any nan with zero and take the mean
 
-                    rv_read_map = mappability.values(chrom,read.reference_start+read.template_length-read.reference_length,read.reference_start+read.template_length)
+                    rv_read_map = mappability.values(chrom,read.reference_start+rl-read.reference_length,read.reference_start+rl)
                     rv_read_map = np.mean(np.nan_to_num(rv_read_map)) #replace any nan with zero and take the mean
-                                
-                #check that the site is in the window          
+                                    
+                    #check that the site is in the window          
                 if midpoint>=start and midpoint<end:
                     #count the fragment
                     cov_dict[midpoint]+=1
 
                     ##get the GC bias
                     read_GC_content = sum(fragment_seq)
-                    read_GC_bias = GC_bias[abs(read.template_length)][read_GC_content]
+                    read_GC_bias = GC_bias[abs(rl)][read_GC_content]
 
                     #count the fragment weighted by GC bias
                     if not np.isnan(read_GC_bias):
@@ -409,15 +473,11 @@ def collect_fragments(input_list):
                         GC_map_cov_dict[midpoint]+=(1/read_GC_bias)*(1/read_map_bias)
                         
                     #print(read_GC_bias,read_map,read_map_bias)
-                    
+                        
                 else: #if fragment doesn't fully overlap
-                    continue
-                    
+                    continue                    
                 del(read,midpoint,fragment_seq)
-                
-            else:
-                #print('reverse',read.is_reverse)
-                continue
+
                 
     output = pd.DataFrame(pd.Series(cov_dict, name = 'uncorrected'))
     output['GC_corrected'] = pd.Series(GC_cov_dict)
@@ -452,8 +512,12 @@ print('Starting fetch')
 sys.stdout.flush()
 start_time = time.time()
 
+## Comment out to run debugging mode:
 p = Pool(processes=CPU) #use the specified number of processes
 results = p.map(collect_fragments, to_fetch.values, 1) #Send only one interval to each processor at a time.
+
+## Uncomment for debugging mode: 
+# results = collect_fragments(to_fetch.values[0])
 
 elapsed_time = time.time()-overall_start_time
 print('Done with fetch '+str(int(np.floor(elapsed_time/60)))+' min '+str(int(np.round(elapsed_time%60)))+' sec')
